@@ -481,6 +481,7 @@ except Exception:
 
 from rich import box as rich_box
 from rich.console import Console
+from rich.markdown import Markdown as _RichMarkdown
 from rich.markup import escape as _escape
 from rich.panel import Panel
 from rich.text import Text as _RichText
@@ -829,6 +830,23 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     ``[not markup]`` while still interpreting real ANSI color codes.
     """
     return _RichText.from_ansi(text or "")
+
+
+def _render_response(text: str):
+    """Render response as Rich Markdown when markdown_enabled is true.
+
+    Falls back to _rich_text_from_ansi for plain ANSI rendering.
+    Markdown rendering gives syntax-highlighted code blocks, bold/italic,
+    headers, lists, and tables — similar to Claude Code's output.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        if cfg.get("display", {}).get("markdown_enabled", False):
+            return _RichMarkdown(text or "", code_theme="monokai")
+    except Exception:
+        pass
+    return _rich_text_from_ansi(text or "")
 
 
 def _cprint(text: str):
@@ -1979,6 +1997,10 @@ class HermesCLI:
             _cprint(f"\n{_GOLD}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
         self._stream_buf += text
+        # Also accumulate full response for markdown re-render at flush
+        if not hasattr(self, "_stream_full_response"):
+            self._stream_full_response = ""
+        self._stream_full_response += text
 
         # Emit complete lines, keep partial remainder in buffer
         _tc = getattr(self, "_stream_text_ansi", "")
@@ -1987,23 +2009,69 @@ class HermesCLI:
             _cprint(f"{_tc}{line}{_RST}" if _tc else line)
 
     def _flush_stream(self) -> None:
-        """Emit any remaining partial line from the stream buffer and close the box."""
+        """Emit any remaining partial line from the stream buffer and close the box.
+
+        When markdown_enabled is true, clears the streamed plain-text output
+        and re-renders the full response as Rich Markdown inside a Panel,
+        giving syntax-highlighted code blocks, formatted headers, and tables.
+        """
         # Close reasoning box if still open (in case no content tokens arrived)
         self._close_reasoning_box()
 
-        if self._stream_buf:
-            _tc = getattr(self, "_stream_text_ansi", "")
-            _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
-            self._stream_buf = ""
+        full_response = getattr(self, "_stream_full_response", "")
+        _use_markdown = False
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            _use_markdown = cfg.get("display", {}).get("markdown_enabled", False)
+        except Exception:
+            pass
 
-        # Close the response box
-        if self._stream_box_opened:
+        if _use_markdown and full_response.strip() and self._stream_box_opened:
+            # Flush any remaining partial line first
+            if self._stream_buf:
+                _tc = getattr(self, "_stream_text_ansi", "")
+                _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
+                self._stream_buf = ""
+            # Close the streaming box
             w = shutil.get_terminal_size().columns
             _cprint(f"{_GOLD}╰{'─' * (w - 2)}╯{_RST}")
+            self._stream_box_opened = False
+
+            # Re-render as markdown Panel
+            try:
+                from hermes_cli.skin_engine import get_active_skin
+                _skin = get_active_skin()
+                label = _skin.get_branding("response_label", "⚕ Hermes")
+                _resp_color = _skin.get_color("response_border", "#CD7F32")
+            except Exception:
+                label = "⚕ Hermes"
+                _resp_color = "#CD7F32"
+            _chat_console = ChatConsole()
+            _chat_console.print(Panel(
+                _RichMarkdown(full_response, code_theme="monokai"),
+                title=f"[{_resp_color} bold]{label}[/]",
+                title_align="left",
+                border_style=_resp_color,
+                box=rich_box.HORIZONTALS,
+                padding=(1, 2),
+            ))
+        else:
+            # Original plain-text flush
+            if self._stream_buf:
+                _tc = getattr(self, "_stream_text_ansi", "")
+                _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
+                self._stream_buf = ""
+
+            # Close the response box
+            if self._stream_box_opened:
+                w = shutil.get_terminal_size().columns
+                _cprint(f"{_GOLD}╰{'─' * (w - 2)}╯{_RST}")
 
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
         self._stream_buf = ""
+        self._stream_full_response = ""
         self._stream_started = False
         self._stream_box_opened = False
         self._reasoning_stream_started = False
@@ -4627,7 +4695,7 @@ class HermesCLI:
 
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _render_response(response),
                         title=f"[{_resp_color} bold]{label} (background #{task_num})[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -4750,7 +4818,7 @@ class HermesCLI:
                         _resp_color = "#4F6D4A"
 
                     ChatConsole().print(Panel(
-                        _rich_text_from_ansi(response),
+                        _render_response(response),
                         title=f"[{_resp_color} bold]⚕ /btw[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -6538,7 +6606,7 @@ class HermesCLI:
                 else:
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _render_response(response),
                         title=f"[{_resp_color} bold]{label}[/]",
                         title_align="left",
                         border_style=_resp_color,
